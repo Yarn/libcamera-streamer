@@ -6,6 +6,8 @@
 # But like, having 640x480 snapshots is crappy and there's no support for doing
 # switch_mode_and_capture_request while using start_recording so things are getting ugly.
 
+import os
+from pathlib import Path
 import io
 import logging
 import socketserver
@@ -15,16 +17,31 @@ import time
 import simplejpeg
 from pprint import pprint
 
+def setup_libcamera_symlink():
+    venv = Path(os.environ['VIRTUAL_ENV'])
+    # ln -s /usr/lib/python3.12/site-packages/libcamera/ \
+    # .venv/lib/python3.12/site-packages/libcamera
+    package_path = venv / 'lib/python3.12/site-packages/libcamera'
+    target = Path('/usr/lib/python3.12/site-packages/libcamera/')
+    assert target.exists(), "need to install libcamera"
+    print(package_path, target)
+    if not package_path.exists():
+        package_path.symlink_to(target)
+        print(package_path, target)
+setup_libcamera_symlink()
+
 import libcamera, picamera2
 from picamera2 import Picamera2
 from picamera2.encoders import MJPEGEncoder, JpegEncoder
 from picamera2.outputs import FileOutput
 
 # Size of live MJPG stream. Pi Camera 3 is 4608x2592, a 16:9 aspect ratio
-STREAM_SIZE = (640, 360)
+STREAM_SIZE = (640, 480)
+# STREAM_SIZE = (1920, 1080)
 
 # Note that OctoPrint is set up with haproxy proxying content from port 8080 to http://host/webcam by default
-PORT = 8070
+# PORT = 8070
+PORT = 8080
 
 # libcamera.Transform(rotation: int = 0, hflip: bool = False, vflip: bool = False, transpose: bool = False)
 TRANSFORM = libcamera.Transform()
@@ -38,7 +55,11 @@ TRANSFORM = libcamera.Transform()
 # So here we tell it the exact size of the sensor mode to use so we can scale down from there.
 # Run `libcamera-hello --list-cameras` to get a list of supported modes.
 
-SENSOR_MODE = (2304, 1296) # 2:2 binned mode for Pi Camera 3
+# SENSOR_MODE = (2304, 1296) # 2:2 binned mode for Pi Camera 3
+# SENSOR_MODE = (1920, 1080)
+# SENSOR_MODE = (640, 480)
+SENSOR_MODE = STREAM_SIZE
+# SENSOR_MODE = (2592, 1944)
 
 CONTROLS = {
     # See https://datasheets.raspberrypi.com/camera/picamera2-manual.pdf under "Appendix C: Camera controls"
@@ -125,6 +146,12 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             self.end_headers()
 
     def _stream_jpeg(self):
+        global connection_count
+        with picam2_lock:
+            connection_count += 1
+            if connection_count >= 1:
+                picam2.start()
+                picam2.start_encoder(jpeg_encoder[0], jpeg_encoder[1])
         try:
             while True:
                 with jpeg_output.condition:
@@ -141,6 +168,12 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
                 'Removed streaming client %s: %s',
                 self.client_address, str(e)
             )
+        finally:
+            with picam2_lock:
+                connection_count -= 1
+                if connection_count <= 0:
+                    picam2.stop_encoder()
+                    picam2.stop()
 
     def _send_snapshot(self):
         self.send_response(200)
@@ -150,6 +183,7 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
         with picam2_lock:
             log.info("got lock")
 
+            picam2.start() # does nothing if camera is already running
             # pause usual preview stream to grab a full-resolution image
             picam2.stop_encoder()
 
@@ -166,7 +200,10 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             log.info("got image")
 
             # picam2.configure(camera_config_stream)
-            picam2.start_encoder(jpeg_encoder[0], jpeg_encoder[1])
+            if connection_count <= 0:
+                picam2.stop()
+            else:
+                picam2.start_encoder(jpeg_encoder[0], jpeg_encoder[1])
             log.info("resume record")
 
         log.info("start encode")
@@ -188,55 +225,62 @@ class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+def main():
+    global log
+    log = logging.getLogger(__name__)
+    logging.basicConfig(level=logging.DEBUG)
+    # logging.getLogger("picamera2", logging.INFO)
 
-log = logging.getLogger("streamer")
-logging.basicConfig(level=logging.DEBUG)
-# logging.getLogger("picamera2", logging.INFO)
+    log.info("Checking camera")
 
-log.info("Checking camera")
+    global connection_count
+    connection_count = 0
 
-picam2 = Picamera2()
+    global picam2
+    picam2 = Picamera2()
 
-raw_mode = None
-for mode in picam2.sensor_modes:
-    if mode["size"] == SENSOR_MODE: raw_mode = mode
+    raw_mode = None
+    for mode in picam2.sensor_modes:
+        if mode["size"] == SENSOR_MODE: raw_mode = mode
 
-if not raw_mode:
-    pprint(picam2.sensor_modes)
-    raise Exception("Failed to find a matching sensor mode")
-
-
-camera_config_stream = picam2.create_video_configuration(
-    main={"size": STREAM_SIZE},
-    raw={
-        "size": raw_mode["size"],
-        "format": raw_mode["format"],
-    },
-)
-camera_config_stream["transform"] = TRANSFORM
-
-camera_config_snapshot = picam2.create_still_configuration(main={"size": SENSOR_MODE})
-camera_config_snapshot["transform"] = TRANSFORM
+    if not raw_mode:
+        pprint(picam2.sensor_modes)
+        raise Exception("Failed to find a matching sensor mode")
 
 
-picam2.configure(camera_config_stream)
-picam2.set_controls(CONTROLS)
-picam2.start()
+    camera_config_stream = picam2.create_video_configuration(
+        main={"size": STREAM_SIZE},
+        raw={
+            "size": raw_mode["size"],
+            "format": raw_mode["format"],
+        },
+    )
+    camera_config_stream["transform"] = TRANSFORM
+
+    global camera_config_snapshot
+    camera_config_snapshot = picam2.create_still_configuration(main={"size": SENSOR_MODE})
+    camera_config_snapshot["transform"] = TRANSFORM
 
 
-jpeg_output = StreamingOutput()
-jpeg_encoder = (MJPEGEncoder(), FileOutput(jpeg_output)) # 22% CPU at 640x480 on my Pi 4, maybe lower qualities around 20%
-# jpeg_encoder = (JpegEncoder(), FileOutput(jpeg_output)) # ~46% CPU on my Pi 4
-picam2.start_encoder(jpeg_encoder[0], jpeg_encoder[1])
+    picam2.configure(camera_config_stream)
+    picam2.set_controls(CONTROLS)
+    # picam2.start()
 
+    global jpeg_output
+    global jpeg_encoder
+    jpeg_output = StreamingOutput()
+    jpeg_encoder = (MJPEGEncoder(), FileOutput(jpeg_output)) # 22% CPU at 640x480 on my Pi 4, maybe lower qualities around 20%
+    # jpeg_encoder = (JpegEncoder(), FileOutput(jpeg_output)) # ~46% CPU on my Pi 4
+    # picam2.start_encoder(jpeg_encoder[0], jpeg_encoder[1])
 
-picam2_lock = threading.Lock()
-log.info("Entering main loop")
-try:
-    address = ('', PORT)
-    server = StreamingServer(address, StreamingHandler)
-    server.serve_forever()
-finally:
-    with picam2_lock:
-        picam2.stop_recording()
+    global picam2_lock
+    picam2_lock = threading.Lock()
+    log.info("Entering main loop")
+    try:
+        address = ('', PORT)
+        server = StreamingServer(address, StreamingHandler)
+        server.serve_forever()
+    finally:
+        with picam2_lock:
+            picam2.stop_recording()
 

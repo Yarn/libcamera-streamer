@@ -1,0 +1,21 @@
+[project]
+name = "libcamera-streamer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "simplejpeg == 1.8.2",
+    "picamera2 == 0.3.25",
+]
+
+[project.scripts]
+libcamera-streamer = "libcamera_streamer:main"
+
+[tool.uv]
+package = true
+[tool.uv.sources]
+# simplejpeg = { git = "https://github.com/jfolz/simplejpeg.git", rev = "c6051d5984987bc2a7f476778cde339a87711412" }
+simplejpeg = { url = "https://github.com/Yarn/libcamera-streamer/releases/download/simplejpeg_1_8_2_wheel_manual/simplejpeg-1.8.2-cp312-cp312-linux_aarch64.whl" }
+picamera2 = { git = "https://github.com/Yarn/picamera2.git" }
+libcamera = { path = "/usr/lib/python3.12/site-packages/libcamera" }
